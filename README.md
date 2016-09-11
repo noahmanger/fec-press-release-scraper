@@ -5,6 +5,7 @@
 * Python 3.x
 * lxml
 * requests
+* dateutil
 
 You need the tapsimple library to run the test suite.
 

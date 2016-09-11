@@ -1,0 +1,197 @@
+#!/usr/bin/env python3
+#
+# Scrape the FEC site for all Weekly Digests.
+# Writes each digest to a unique .json file with meta+content.
+#
+# Usage:
+#  python fec-digest-scraper
+
+from lxml import html
+from lxml.etree import XPath
+from lxml.etree import tostring
+from datetime import datetime
+from dateutil.parser import parse
+
+import hashlib
+import requests
+import pprint
+import json
+import os
+import sys
+import re
+
+base_url = 'http://www.fec.gov/press/'
+digest_list = 'weekly_digests.shtml'
+
+###############################################################
+# methods
+def debug_mode():
+  return os.environ.get('DEBUG')
+
+def shasum_for_href(href):
+  return hashlib.sha1(href.encode()).hexdigest()
+
+def fetch_digest(href):
+  # create html cache dir if necessary
+  if not os.path.isdir('./html'):
+    os.mkdir('./html')
+
+  html_cache_file = './html/' + shasum_for_href(href) + '.html'
+  if os.path.isfile(html_cache_file):
+    html_buf = open(html_cache_file, 'r').read()
+  else:
+    page = requests.get(base_url + href)
+    if page.headers['content-type'] != 'text/html':
+      html_buf = "<html><body><a href='{0}' class='pdf'>PDF</a></body></html>".format(href).encode('latin1')
+    else:
+      html_buf = page.content
+    with open(html_cache_file, 'w') as cached_html:
+      cached_html.write(html_buf.decode('latin1'))
+
+  tree = html.fromstring(html_buf)
+  digest_els = tree.xpath('//div[@class="press_release_content"]')
+
+  if not digest_els:
+    digest_els = tree.xpath('//div[@id="fec_mainContent"]')
+
+  if not digest_els:
+    digest_els = tree.xpath('//div[@id="fec_press_content"]')
+
+  # this is a last gasp. there are likely other recogizable patterns
+  # that should be matched first, but that haven't yet been found.
+  if not digest_els:
+    digest_els = tree.xpath('//body')
+
+  if len(digest_els) == 0:
+    print("ERROR: Failed to local press release content for ", href)
+    print("Cached in ", html_cache_file)
+    debug_html_element(tree)
+
+  return digest_els
+
+def parse_digest(digest, href):
+  # remove all the 'style' attributes
+  for tag in digest.xpath('//*[@style]'):
+    tag.attrib.pop('style')
+
+  digest_data = { 'html': tostring(digest).decode('UTF-8'), 'href': href }
+  digest_data['pdf'] = parse_pdf_link(digest)
+
+  return digest_data
+
+def parse_pdf_link(digest):
+  link = digest.xpath('//a[@class="pdf"]')
+
+  if link:
+    return link[0].attrib.pop('href')
+
+  return None
+
+def debug_html_element(el):
+  print('HTML: %s' % tostring(el, pretty_print=True).decode('UTF-8'))
+
+def fetch_digest_list():
+  # fetch the master list, or use local cached version
+  if not os.path.isfile(digest_list):
+    page = requests.get(base_url + digest_list)
+    with open(digest_list, 'w') as cached_digest_list:
+      cached_digest_list.write(page.content.decode('latin1'))
+
+  # create output dir if it does not yet exist
+  if not os.path.isdir('./json'):
+    os.mkdir('./json')
+
+  # parse the master list
+  filehandle = open(digest_list, 'r')
+  return html.fromstring(filehandle.read())
+
+def parse_date(href, title):
+    # Try to parse the date from the url
+    # If that doesn't work, we'll try from the title
+    try:
+        base = href.split('/')[-1]
+        # Get the date from the last fragment of the url
+        if 'digest' in base:
+            date = base.split('digest')[0]
+        elif 'Digest' in base:
+            date = base.split('Digest')[0]
+        elif '_' in base:
+            date = base.split('_')[0].replace('_','')
+        else:
+            date = base.split('.')[0].replace('.','')
+        parsed = parse(date)
+    except ValueError:
+        try:
+            date = title.split('-')[1]
+            parsed = parse(date)
+        except ValueError:
+            # For 'Week of July 27 - 31, 2009' we use the href which is easier
+            date = base.split('/')[-1].split('_')[0]
+            parsed = datetime.strptime(date, '%Y%m%d')
+
+    return parsed.strftime('%m/%d/%Y')
+
+
+def process_digest_list():
+  tree = fetch_digest_list()
+  digests = tree.xpath('//table[@id="weekly_digest"]/tbody/tr')
+  cell_text = XPath('./td//text()')
+  title_cell = XPath('./td/*/a|./td/a')
+  for row in digests:
+    cells = cell_text(row)
+    issue = cells[0]
+    title = cells[1]
+    digest_link = title_cell(row)
+
+    if not digest_link:
+      print("No digest link for row %s" % tostring(row))
+      continue
+
+    href = digest_link[0].get('href')
+    if debug_mode():
+      print("href=%s" % href)
+
+    date = parse_date(href, title)
+
+    digest_data = process_digest_page(href)
+    if not digest_data:
+      print("href %s was empty" % href)
+      continue
+
+    cache_json(href, issue, title, date, digest_data)
+
+def cache_json(href, issue, title, date, digest_data):
+  digest_data['href'] = href
+  digest_data['issue'] = issue
+  digest_data['title'] = title
+  digest_data['date'] = date
+  write_json_file(href, digest_data)
+
+def process_digest_page(href):
+  digest_els = fetch_digest(href)
+  if digest_els is None or len(digest_els) is 0:
+    print("ERROR: No PR content in %s" % href)
+    return
+
+  digest = digest_els[0]
+  if debug_mode():
+    debug_html_element(digest)
+
+  return parse_digest(digest, href)
+
+def write_json_file(href, digest_data):
+  json_file_name = shasum_for_href(href) + '.json'
+  with open('json/'+json_file_name, 'w') as json_file:
+    json.dump(digest_data, json_file)
+
+##########################################################
+# main
+if len(sys.argv) > 1:
+  # skip script name
+  sys.argv.pop(0)
+  for href in sys.argv:
+    digest_data = process_digest_page(href)
+    print( json.dumps(digest_data) )
+
+else:
+  process_digest_list()

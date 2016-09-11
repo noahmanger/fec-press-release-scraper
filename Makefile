@@ -7,5 +7,6 @@ test:
 
 run:
 	./fec-press-release-scraper
+	./fec-press-release-scraper
 
 .PHONY: all check test run
